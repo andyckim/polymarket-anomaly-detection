@@ -1,0 +1,51 @@
+{
+  "_comment": "Drop any subset of these keys — unspecified fields keep their defaults.",
+
+  "scoring": {
+    "alert_threshold": 3.0,
+    "high_severity_threshold": 6.0,
+    "weight_by_liquidity": true,
+    "max_single_factor_score": 3.0
+  },
+
+  "trade_size": {
+    "min_trade_size_usd": 100.0,
+    "large_trade_threshold_usd": 10000.0,
+    "whale_trade_threshold_usd": 50000.0,
+    "large_trade_score_bonus": 1.0,
+    "whale_trade_score_bonus": 2.0
+  },
+
+  "account": {
+    "new_account_age_days": 30,
+    "new_account_score_multiplier": 1.5,
+    "min_prior_trades_for_established": 10,
+    "low_history_score_multiplier": 1.3
+  },
+
+  "volume": {
+    "trade_volume_fraction_threshold": 0.10,
+    "thin_market_volume_usd": 5000.0,
+    "thin_market_score_multiplier": 2.0,
+    "volume_spike_window_minutes": 60,
+    "volume_spike_multiplier": 3.0,
+    "volume_spike_score_bonus": 1.0
+  },
+
+  "price_impact": {
+    "min_price_impact": 0.05,
+    "price_impact_score_per_cent": 0.2,
+    "high_conviction_price_threshold": 0.85,
+    "high_conviction_score_bonus": 1.5
+  },
+
+  "timing": {
+    "late_trade_window_hours": 24.0,
+    "late_trade_score_multiplier": 1.4,
+    "early_trade_window_hours": 1.0,
+    "early_large_trade_score_bonus": 0.8
+  },
+
+  "watched_markets": [],
+  "ignored_markets": []
+}
