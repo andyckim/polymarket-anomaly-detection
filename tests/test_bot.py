@@ -417,3 +417,182 @@ class TestPollWatchedMarkets:
                 run(bot._poll(client, detector))
 
         assert set(scanned) == {"cid_a", "cid_b"}
+
+
+# ---------------------------------------------------------------------------
+# AnomalyBot._collect_tokens
+# ---------------------------------------------------------------------------
+
+class TestCollectTokens:
+    def _bot_with_cache(self, market_cache, watched=None):
+        cfg = AnomalyConfig()
+        if watched is not None:
+            cfg.watched_markets = watched
+        bot = AnomalyBot(cfg)
+        bot._market_cache = market_cache
+        return bot
+
+    def _market(self, cid, slug, tokens):
+        return {"conditionId": cid, "slug": slug, "tokens": tokens}
+
+    def _tok(self, tid, outcome="Yes"):
+        return {"token_id": tid, "outcome": outcome}
+
+    def test_returns_all_token_ids(self):
+        cache = {
+            "cid1": self._market("cid1", "s1", [self._tok("t1"), self._tok("t2", "No")]),
+            "cid2": self._market("cid2", "s2", [self._tok("t3")]),
+        }
+        bot = self._bot_with_cache(cache)
+        ids, mapping = bot._collect_tokens()
+        assert set(ids) == {"t1", "t2", "t3"}
+
+    def test_each_token_maps_to_correct_market(self):
+        cache = {
+            "cid1": self._market("cid1", "s1", [self._tok("t1")]),
+            "cid2": self._market("cid2", "s2", [self._tok("t2")]),
+        }
+        bot = self._bot_with_cache(cache)
+        _, mapping = bot._collect_tokens()
+        assert mapping["t1"]["conditionId"] == "cid1"
+        assert mapping["t2"]["conditionId"] == "cid2"
+
+    def test_watched_markets_filters_by_condition_id(self):
+        cache = {
+            "cid_a": self._market("cid_a", "sa", [self._tok("ta")]),
+            "cid_b": self._market("cid_b", "sb", [self._tok("tb")]),
+        }
+        bot = self._bot_with_cache(cache, watched=["cid_a"])
+        ids, _ = bot._collect_tokens()
+        assert "ta" in ids
+        assert "tb" not in ids
+
+    def test_watched_markets_filters_by_slug(self):
+        cache = {
+            "cid_a": self._market("cid_a", "slug_a", [self._tok("ta")]),
+            "cid_b": self._market("cid_b", "slug_b", [self._tok("tb")]),
+        }
+        bot = self._bot_with_cache(cache, watched=["slug_b"])
+        ids, _ = bot._collect_tokens()
+        assert "tb" in ids
+        assert "ta" not in ids
+
+    def test_empty_cache_returns_empty(self):
+        bot = self._bot_with_cache({})
+        ids, mapping = bot._collect_tokens()
+        assert ids == []
+        assert mapping == {}
+
+    def test_market_without_tokens_key(self):
+        cache = {"cid1": {"conditionId": "cid1", "slug": "s1"}}  # no "tokens"
+        bot = self._bot_with_cache(cache)
+        ids, _ = bot._collect_tokens()
+        assert ids == []
+
+    def test_token_without_token_id_skipped(self):
+        cache = {"cid1": self._market("cid1", "s1", [{"outcome": "Yes"}])}
+        bot = self._bot_with_cache(cache)
+        ids, _ = bot._collect_tokens()
+        assert ids == []
+
+
+# ---------------------------------------------------------------------------
+# AnomalyBot._process_streamed_trade
+# ---------------------------------------------------------------------------
+
+class TestProcessStreamedTrade:
+    def _setup(self):
+        bot = AnomalyBot(AnomalyConfig())
+        detector = MagicMock()
+        detector.score_trade = AsyncMock(return_value=None)
+        return bot, detector
+
+    def _trade(self, token_id="tok1", price="0.6", usdc="60", cid="cid1", ws_id=None):
+        return {
+            "usdcSize": usdc,
+            "price": price,
+            "conditionId": cid,
+            "proxyWallet": "",
+            "_token_id": token_id,
+            "_ws_id": ws_id or f"{token_id}_1000_{price}_{usdc}",
+        }
+
+    def test_deduplication_by_ws_id(self):
+        bot, detector = self._setup()
+        trade = self._trade()
+        market = {"conditionId": "cid1"}
+        token_to_market = {"tok1": market}
+
+        run(bot._process_streamed_trade(trade, token_to_market, detector))
+        run(bot._process_streamed_trade(trade, token_to_market, detector))
+        assert detector.score_trade.call_count == 1
+
+    def test_token_to_market_lookup(self):
+        bot, detector = self._setup()
+        market = {"conditionId": "cid1"}
+        token_to_market = {"tok1": market}
+        trade = self._trade(token_id="tok1")
+
+        run(bot._process_streamed_trade(trade, token_to_market, detector))
+        _args, _ = detector.score_trade.call_args
+        assert _args[1] is market
+
+    def test_falls_back_to_market_cache_by_condition_id(self):
+        bot, detector = self._setup()
+        market = {"conditionId": "cid1"}
+        bot._market_cache = {"cid1": market}
+        trade = self._trade(token_id="unknown_tok", cid="cid1")
+
+        run(bot._process_streamed_trade(trade, {}, detector))
+        _args, _ = detector.score_trade.call_args
+        assert _args[1] is market
+
+    def test_uses_empty_dict_when_market_not_found(self):
+        bot, detector = self._setup()
+        trade = self._trade(token_id="tok_x", cid="unknown_cid")
+
+        run(bot._process_streamed_trade(trade, {}, detector))
+        _args, _ = detector.score_trade.call_args
+        assert _args[1] == {}
+
+    def test_pre_price_from_last_price_cache(self):
+        bot, detector = self._setup()
+        bot._last_price["tok1"] = 0.55
+        trade = self._trade(token_id="tok1", price="0.65")
+
+        run(bot._process_streamed_trade(trade, {}, detector))
+        _args, _ = detector.score_trade.call_args
+        assert _args[2] == pytest.approx(0.55)
+
+    def test_post_price_updates_last_price_cache(self):
+        bot, detector = self._setup()
+        trade = self._trade(token_id="tok1", price="0.70")
+
+        run(bot._process_streamed_trade(trade, {}, detector))
+        assert bot._last_price["tok1"] == pytest.approx(0.70)
+
+    def test_zero_post_price_does_not_update_cache(self):
+        bot, detector = self._setup()
+        bot._last_price["tok1"] = 0.60
+        trade = self._trade(token_id="tok1", price="0")
+
+        run(bot._process_streamed_trade(trade, {}, detector))
+        assert bot._last_price["tok1"] == pytest.approx(0.60)
+
+    def test_alert_called_on_anomaly_result(self):
+        bot, detector = self._setup()
+        mock_result = MagicMock()
+        detector.score_trade = AsyncMock(return_value=mock_result)
+        trade = self._trade()
+
+        with patch("bot.alert") as mock_alert:
+            run(bot._process_streamed_trade(trade, {}, detector))
+            mock_alert.assert_called_once_with(mock_result)
+
+    def test_seen_tx_cleared_when_over_limit(self):
+        bot, detector = self._setup()
+        bot._seen_tx = set(str(i) for i in range(100_001))
+        trade = self._trade(ws_id="brand_new_id")
+
+        run(bot._process_streamed_trade(trade, {}, detector))
+        assert len(bot._seen_tx) == 0  # cleared before adding new id

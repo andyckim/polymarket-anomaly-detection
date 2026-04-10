@@ -5,19 +5,25 @@ APIs used (all public, no auth required):
   Gamma API  : market/event discovery
   Data API   : trades, activity, positions
   CLOB API   : orderbook, price history, midpoints
+  CLOB WS    : real-time trade stream (wss://ws-subscriptions-clob.polymarket.com/ws/market)
 """
 
 import asyncio
+import json
+import logging
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 import aiohttp
 
 
+log = logging.getLogger(__name__)
+
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-DATA_BASE = "https://data-api.polymarket.com"
-CLOB_BASE = "https://clob.polymarket.com"
+DATA_BASE  = "https://data-api.polymarket.com"
+CLOB_BASE  = "https://clob.polymarket.com"
+WS_BASE    = "wss://ws-subscriptions-clob.polymarket.com/ws"
 
 
 class PolymarketClient:
@@ -181,3 +187,104 @@ class PolymarketClient:
         if end_ts is None:
             return None
         return (end_ts - time.time()) / 3600
+
+    # ------------------------------------------------------------------ #
+    # CLOB WebSocket — real-time trade stream
+    # ------------------------------------------------------------------ #
+
+    async def stream_trades(
+        self,
+        token_ids: list[str],
+        *,
+        max_backoff: float = 60.0,
+    ) -> AsyncGenerator[dict, None]:
+        """
+        Yield normalised trade dicts in real time via the CLOB WebSocket.
+
+        Subscribes to the ``market`` channel for every token in *token_ids*
+        and emits one dict per ``last_trade_price`` event.  Each dict uses the
+        same field names as the REST /trades endpoint so that
+        ``AnomalyDetector.score_trade`` works without modification.
+
+        Extra internal fields:
+          ``_token_id`` – the outcome-token asset ID of the trade
+          ``_ws_id``    – a unique key used for deduplication
+
+        Reconnects automatically with exponential back-off on any error.
+        The caller is responsible for cancelling the iteration when done.
+        """
+        if not token_ids:
+            return
+
+        backoff = 1.0
+        while True:
+            try:
+                async with self._session.ws_connect(f"{WS_BASE}/market") as ws:
+                    await ws.send_json({"assets_ids": token_ids, "type": "market"})
+                    backoff = 1.0
+                    log.info(
+                        "WebSocket connected — subscribed to %d token(s)", len(token_ids)
+                    )
+
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                payload = json.loads(msg.data)
+                            except json.JSONDecodeError:
+                                continue
+
+                            events = payload if isinstance(payload, list) else [payload]
+                            for event in events:
+                                if event.get("event_type") == "last_trade_price":
+                                    trade = self._normalise_ws_trade(event)
+                                    if trade:
+                                        yield trade
+
+                        elif msg.type in (
+                            aiohttp.WSMsgType.ERROR,
+                            aiohttp.WSMsgType.CLOSED,
+                        ):
+                            log.warning("WebSocket closed (type=%s) — reconnecting", msg.type)
+                            break
+
+            except asyncio.CancelledError:
+                raise  # propagate cancellation without delay
+            except Exception as exc:
+                log.warning(
+                    "WebSocket error: %s — reconnecting in %.0fs", exc, backoff
+                )
+
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+    @staticmethod
+    def _normalise_ws_trade(event: dict) -> Optional[dict]:
+        """
+        Convert a CLOB WebSocket ``last_trade_price`` event to the trade dict
+        shape expected by ``AnomalyDetector.score_trade``.
+
+        Returns *None* if the event is missing required numeric fields.
+        """
+        try:
+            price = float(event.get("price", 0))
+            size  = float(event.get("size",  0))
+        except (TypeError, ValueError):
+            return None
+
+        if price <= 0 or size <= 0:
+            return None
+
+        asset     = str(event.get("asset",     ""))
+        timestamp = str(event.get("timestamp", ""))
+
+        return {
+            # Fields consumed by AnomalyDetector.score_trade / factor scorers
+            "usdcSize":    str(price * size),
+            "price":       str(price),
+            "side":        str(event.get("side",        "")),
+            "conditionId": str(event.get("conditionId", "")),
+            "proxyWallet": "",
+            # Internal helpers (not used by the detector)
+            "_token_id": asset,
+            "_ws_id":    f"{asset}_{timestamp}_{price}_{size}",
+        }

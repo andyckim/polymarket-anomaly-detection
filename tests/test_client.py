@@ -263,6 +263,207 @@ class TestGetLastTradePrice:
 # Context manager / session ownership
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# _normalise_ws_trade (static)
+# ---------------------------------------------------------------------------
+
+class TestNormaliseWsTrade:
+    def test_valid_event_returns_dict(self):
+        event = {
+            "event_type": "last_trade_price",
+            "asset": "tok123",
+            "price": 0.75,
+            "size": 100,
+            "side": "BUY",
+            "timestamp": 1700000000,
+            "conditionId": "cid1",
+        }
+        trade = PolymarketClient._normalise_ws_trade(event)
+        assert trade is not None
+        assert trade["price"] == "0.75"
+        assert trade["side"] == "BUY"
+        assert trade["conditionId"] == "cid1"
+        assert trade["proxyWallet"] == ""
+        assert trade["_token_id"] == "tok123"
+
+    def test_usdcsize_is_price_times_size(self):
+        trade = PolymarketClient._normalise_ws_trade(
+            {"asset": "t", "price": 0.5, "size": 200, "timestamp": 1}
+        )
+        assert trade is not None
+        assert float(trade["usdcSize"]) == pytest.approx(100.0)
+
+    def test_ws_id_is_unique_per_event(self):
+        base = {"asset": "t", "price": 0.5, "size": 100, "timestamp": 1000}
+        t1 = PolymarketClient._normalise_ws_trade({**base})
+        t2 = PolymarketClient._normalise_ws_trade({**base, "timestamp": 1001})
+        assert t1["_ws_id"] != t2["_ws_id"]
+
+    def test_zero_price_returns_none(self):
+        assert PolymarketClient._normalise_ws_trade(
+            {"asset": "t", "price": 0, "size": 100, "timestamp": 1}
+        ) is None
+
+    def test_zero_size_returns_none(self):
+        assert PolymarketClient._normalise_ws_trade(
+            {"asset": "t", "price": 0.5, "size": 0, "timestamp": 1}
+        ) is None
+
+    def test_missing_price_returns_none(self):
+        assert PolymarketClient._normalise_ws_trade(
+            {"asset": "t", "size": 100, "timestamp": 1}
+        ) is None
+
+    def test_non_numeric_price_returns_none(self):
+        assert PolymarketClient._normalise_ws_trade(
+            {"asset": "t", "price": "bad", "size": 100, "timestamp": 1}
+        ) is None
+
+    def test_string_numeric_fields_accepted(self):
+        """WS may send numbers as strings."""
+        trade = PolymarketClient._normalise_ws_trade(
+            {"asset": "t", "price": "0.6", "size": "50", "timestamp": "1000"}
+        )
+        assert trade is not None
+        assert float(trade["usdcSize"]) == pytest.approx(30.0)
+
+    def test_missing_optional_fields_use_empty_string(self):
+        trade = PolymarketClient._normalise_ws_trade(
+            {"price": 0.5, "size": 100, "timestamp": 1}
+        )
+        assert trade is not None
+        assert trade["side"] == ""
+        assert trade["conditionId"] == ""
+        assert trade["_token_id"] == ""
+
+
+# ---------------------------------------------------------------------------
+# stream_trades  (mocked WebSocket)
+# ---------------------------------------------------------------------------
+
+class TestStreamTrades:
+    """
+    stream_trades runs a `while True` reconnection loop, so tests use
+    asyncio.wait_for to bound execution.  All mock operations are instant
+    so trades are collected before the timeout fires; the timeout just
+    interrupts the reconnect sleep.
+    """
+
+    def _make_ws_client(self, payloads):
+        """
+        Build a PolymarketClient whose WS yields one TEXT message per payload
+        then exhausts.  `payloads` is a list of dicts or lists (raw JSON bodies).
+        """
+        import aiohttp as _aio
+        import json as _json
+
+        class FakeWS:
+            def __init__(self):
+                self._iter = iter(payloads)
+
+            async def send_json(self, _):
+                pass
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    payload = next(self._iter)
+                    msg = MagicMock()
+                    msg.type = _aio.WSMsgType.TEXT
+                    msg.data = _json.dumps(payload)
+                    return msg
+                except StopIteration:
+                    raise StopAsyncIteration
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                pass
+
+        mock_session = MagicMock()
+        # Return a fresh FakeWS on each call so reconnects don't re-deliver messages
+        mock_session.ws_connect = MagicMock(side_effect=lambda *a, **k: FakeWS())
+        return PolymarketClient(session=mock_session)
+
+    @staticmethod
+    def _collect(client, token_ids, timeout=0.5):
+        """Run stream_trades, collecting trades until timeout interrupts the reconnect sleep."""
+        async def _inner():
+            trades = []
+            async def _gather():
+                async for t in client.stream_trades(token_ids):
+                    trades.append(t)
+            try:
+                await asyncio.wait_for(_gather(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+            return trades
+        return run(_inner())
+
+    def test_yields_trade_for_last_trade_price_event(self):
+        event = [{
+            "event_type": "last_trade_price",
+            "asset": "tok1", "price": 0.7, "size": 100,
+            "side": "BUY", "timestamp": 1000, "conditionId": "cid1",
+        }]
+        trades = self._collect(self._make_ws_client([event]), ["tok1"])
+        assert len(trades) == 1
+        assert trades[0]["conditionId"] == "cid1"
+        assert float(trades[0]["usdcSize"]) == pytest.approx(70.0)
+
+    def test_skips_non_trade_events(self):
+        payloads = [
+            [{"event_type": "book", "asset": "tok1"}],
+            [{"event_type": "last_trade_price", "asset": "tok1",
+              "price": 0.5, "size": 50, "timestamp": 1, "conditionId": "c1"}],
+        ]
+        trades = self._collect(self._make_ws_client(payloads), ["tok1"])
+        assert len(trades) == 1
+
+    def test_handles_single_object_payload(self):
+        """WS may send a single event dict instead of a list."""
+        single = {
+            "event_type": "last_trade_price",
+            "asset": "tok1", "price": 0.6, "size": 80,
+            "timestamp": 2, "conditionId": "cid2",
+        }
+        trades = self._collect(self._make_ws_client([single]), ["tok1"])
+        assert len(trades) == 1
+
+    def test_empty_token_list_yields_nothing(self):
+        client = self._make_ws_client([])
+
+        async def collect():
+            return [t async for t in client.stream_trades([])]
+
+        assert run(collect()) == []
+
+    def test_skips_events_with_invalid_price(self):
+        payloads = [[
+            {"event_type": "last_trade_price", "asset": "t",
+             "price": 0, "size": 100, "timestamp": 1},
+        ]]
+        trades = self._collect(self._make_ws_client(payloads), ["t"])
+        assert trades == []
+
+    def test_multiple_trades_in_one_message(self):
+        payloads = [[
+            {"event_type": "last_trade_price", "asset": "t", "price": 0.5,
+             "size": 100, "timestamp": 1, "conditionId": "c1"},
+            {"event_type": "last_trade_price", "asset": "t", "price": 0.6,
+             "size": 50, "timestamp": 2, "conditionId": "c1"},
+        ]]
+        trades = self._collect(self._make_ws_client(payloads), ["t"])
+        assert len(trades) == 2
+
+
+# ---------------------------------------------------------------------------
+# Context manager / session ownership
+# ---------------------------------------------------------------------------
+
 class TestClientSessionOwnership:
     def test_external_session_not_closed_on_exit(self):
         """When the caller owns the session, client.__aexit__ must not close it."""
