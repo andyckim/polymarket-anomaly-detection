@@ -94,7 +94,8 @@ class AnomalyBot:
         self._last_price: dict[str, float] = {}  # token_id -> last known price
 
     async def run(self):
-        log.info("Starting Polymarket Anomaly Bot")
+        """Polling mode — fetches recent trades on a fixed interval (default 30 s)."""
+        log.info("Starting Polymarket Anomaly Bot [poll mode]")
         log.info(self.config.summary())
 
         async with aiohttp.ClientSession() as session:
@@ -107,6 +108,49 @@ class AnomalyBot:
                 except Exception as e:
                     log.error("Poll error: %s", e, exc_info=True)
                 await asyncio.sleep(self.poll_interval)
+
+    async def run_streaming(self):
+        """
+        Streaming mode — subscribes to Polymarket's CLOB WebSocket for
+        real-time trade alerts with zero polling latency.
+
+        The market list is refreshed every 5 minutes so newly opened markets
+        are picked up automatically.  Reconnects to the WebSocket with
+        exponential back-off on any connection failure.
+        """
+        log.info("Starting Polymarket Anomaly Bot [streaming mode]")
+        log.info(self.config.summary())
+
+        async with aiohttp.ClientSession() as session:
+            client   = PolymarketClient(session)
+            detector = AnomalyDetector(self.config, client)
+
+            while True:
+                # Refresh market cache and rebuild subscription list
+                await self._refresh_markets(client)
+                token_ids, token_to_market = self._collect_tokens()
+
+                if not token_ids:
+                    log.warning("No tokens found — retrying in 60s")
+                    await asyncio.sleep(60)
+                    continue
+
+                log.info(
+                    "Subscribing to %d token(s) across %d market(s) …",
+                    len(token_ids), len(token_to_market),
+                )
+
+                try:
+                    # Stream for up to 5 minutes, then refresh subscriptions
+                    await asyncio.wait_for(
+                        self._stream_loop(client, detector, token_ids, token_to_market),
+                        timeout=300.0,
+                    )
+                except asyncio.TimeoutError:
+                    log.info("Refreshing market subscriptions …")
+                except Exception as exc:
+                    log.error("Streaming error: %s", exc, exc_info=True)
+                    await asyncio.sleep(5)
 
     async def _poll(self, client: PolymarketClient, detector: AnomalyDetector):
         # Refresh market list periodically
@@ -142,6 +186,77 @@ class AnomalyBot:
             log.info("Market cache refreshed: %d markets", len(self._market_cache))
         except Exception as e:
             log.warning("Failed to refresh market cache: %s", e)
+
+    # ------------------------------------------------------------------ #
+    # Streaming helpers
+    # ------------------------------------------------------------------ #
+
+    def _collect_tokens(self) -> tuple[list[str], dict[str, dict]]:
+        """
+        Build ``(token_ids, token_id → market)`` for every outcome token in
+        the market cache, honouring the ``watched_markets`` filter.
+        """
+        markets = list(self._market_cache.values())
+        if self.config.watched_markets:
+            watched = set(self.config.watched_markets)
+            markets = [
+                m for m in markets
+                if m.get("conditionId") in watched or m.get("slug") in watched
+            ]
+        token_to_market: dict[str, dict] = {}
+        for market in markets:
+            for token in (market.get("tokens") or []):
+                tid = token.get("token_id")
+                if tid:
+                    token_to_market[tid] = market
+        return list(token_to_market.keys()), token_to_market
+
+    async def _stream_loop(
+        self,
+        client: PolymarketClient,
+        detector: AnomalyDetector,
+        token_ids: list[str],
+        token_to_market: dict[str, dict],
+    ):
+        async for trade in client.stream_trades(token_ids):
+            await self._process_streamed_trade(trade, token_to_market, detector)
+
+    async def _process_streamed_trade(
+        self,
+        trade: dict,
+        token_to_market: dict[str, dict],
+        detector: AnomalyDetector,
+    ):
+        # Deduplicate using the synthetic WS id
+        ws_id = trade.get("_ws_id")
+        if ws_id and ws_id in self._seen_tx:
+            return
+        if ws_id:
+            self._seen_tx.add(ws_id)
+
+        # Resolve which market this trade belongs to
+        token_id = trade.get("_token_id", "")
+        market   = token_to_market.get(token_id)
+        if not market:
+            market = self._market_cache.get(trade.get("conditionId", ""), {})
+
+        # Maintain pre-trade price cache (same logic as polling mode)
+        pre_price  = self._last_price.get(token_id) if token_id else None
+        post_price = float(trade.get("price") or 0)
+        if token_id and post_price:
+            self._last_price[token_id] = post_price
+
+        # Bound the seen-tx set
+        if len(self._seen_tx) > 100_000:
+            self._seen_tx.clear()
+
+        result = await detector.score_trade(trade, market, pre_price)
+        if result:
+            alert(result)
+
+    # ------------------------------------------------------------------ #
+    # Polling helpers (original)
+    # ------------------------------------------------------------------ #
 
     async def _scan_market(
         self,
@@ -191,8 +306,19 @@ class AnomalyBot:
 async def main():
     parser = argparse.ArgumentParser(description="Polymarket Anomaly Bot")
     parser.add_argument("--config", help="Path to JSON config overrides", default=None)
-    parser.add_argument("--interval", type=float, default=30.0,
-                        help="Poll interval in seconds (default: 30)")
+    parser.add_argument(
+        "--mode",
+        choices=["stream", "poll"],
+        default="stream",
+        help=(
+            "stream (default) = real-time WebSocket alerts; "
+            "poll = REST polling every --interval seconds"
+        ),
+    )
+    parser.add_argument(
+        "--interval", type=float, default=30.0,
+        help="Poll interval in seconds (poll mode only, default: 30)",
+    )
     parser.add_argument("--markets", nargs="*",
                         help="condition_ids or slugs to watch (default: all)")
     args = parser.parse_args()
@@ -202,7 +328,10 @@ async def main():
         cfg.watched_markets = args.markets
 
     bot = AnomalyBot(cfg, poll_interval_seconds=args.interval)
-    await bot.run()
+    if args.mode == "stream":
+        await bot.run_streaming()
+    else:
+        await bot.run()
 
 
 if __name__ == "__main__":
