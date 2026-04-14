@@ -16,8 +16,48 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def make_test_cfg() -> AnomalyConfig:
+    """
+    Return a config with stable, pinned values for unit tests.
+    These are independent of the production defaults so that tuning
+    config.py does not break factor-level tests.
+    """
+    cfg = AnomalyConfig()
+    # trade size
+    cfg.trade_size.min_trade_size_usd          = 100.0
+    cfg.trade_size.large_trade_threshold_usd   = 10_000.0
+    cfg.trade_size.large_trade_score_bonus     = 1.0
+    cfg.trade_size.whale_trade_threshold_usd   = 50_000.0
+    cfg.trade_size.whale_trade_score_bonus     = 2.0
+    # volume
+    cfg.volume.trade_volume_fraction_threshold = 0.10
+    cfg.volume.thin_market_volume_usd          = 5_000.0
+    cfg.volume.thin_market_score_multiplier    = 2.0
+    cfg.volume.volume_spike_multiplier         = 3.0
+    cfg.volume.volume_spike_score_bonus        = 1.0
+    # price impact
+    cfg.price_impact.min_price_impact                = 0.05
+    cfg.price_impact.price_impact_score_per_cent     = 0.2
+    cfg.price_impact.high_conviction_price_threshold = 0.85
+    cfg.price_impact.high_conviction_score_bonus     = 1.5
+    # timing
+    cfg.timing.late_trade_score_multiplier    = 1.4
+    cfg.timing.early_large_trade_score_bonus  = 0.8
+    # account
+    cfg.account.new_account_age_days               = 30
+    cfg.account.new_account_score_multiplier       = 1.5
+    cfg.account.min_prior_trades_for_established   = 10
+    cfg.account.low_history_score_multiplier       = 1.3
+    # scoring
+    cfg.scoring.alert_threshold          = 3.0
+    cfg.scoring.high_severity_threshold  = 6.0
+    cfg.scoring.max_single_factor_score  = 3.0
+    cfg.scoring.weight_by_liquidity      = True
+    return cfg
+
+
 def make_detector(cfg=None):
-    cfg = cfg or AnomalyConfig()
+    cfg = cfg if cfg is not None else make_test_cfg()
     client = MagicMock()
     client.get_wallet_first_trade_timestamp = AsyncMock(return_value=None)
     client.get_wallet_trade_count = AsyncMock(return_value=100)
@@ -479,11 +519,20 @@ class TestScoreTrade:
         trade = {"usdcSize": "200", "conditionId": "c", "proxyWallet": "", "price": "0.5"}
         assert run(det.score_trade(trade, {})) is None
 
+    def _cfg_for_score_trade(self, **overrides):
+        """Pinned integration config so score_trade tests are self-contained."""
+        cfg = make_test_cfg()
+        for k, v in overrides.items():
+            obj, attr = k.split("__", 1)
+            setattr(getattr(cfg, obj), attr, v)
+        return cfg
+
     def test_high_score_returns_anomaly_result(self):
-        cfg = AnomalyConfig()
-        cfg.scoring.alert_threshold = 0.5
-        cfg.scoring.weight_by_liquidity = False
-        cfg.trade_size.large_trade_threshold_usd = 100.0
+        cfg = self._cfg_for_score_trade(
+            scoring__alert_threshold=0.5,
+            scoring__weight_by_liquidity=False,
+            trade_size__large_trade_threshold_usd=100.0,
+        )
         det, client = make_detector(cfg)
         client.hours_until_close.return_value = None
         trade = {"usdcSize": "200", "conditionId": "c", "proxyWallet": "", "price": "0.5"}
@@ -491,42 +540,45 @@ class TestScoreTrade:
         assert isinstance(result, AnomalyResult)
 
     def test_severity_low(self):
-        cfg = AnomalyConfig()
-        cfg.scoring.alert_threshold = 3.0
-        cfg.scoring.high_severity_threshold = 10.0
-        cfg.scoring.weight_by_liquidity = False
-        cfg.scoring.max_single_factor_score = 10.0
+        # whale trade raw=3.0 < threshold*1.5=4.5 → LOW
+        cfg = self._cfg_for_score_trade(
+            scoring__alert_threshold=3.0,
+            scoring__high_severity_threshold=10.0,
+            scoring__weight_by_liquidity=False,
+            scoring__max_single_factor_score=10.0,
+        )
         det, client = make_detector(cfg)
         client.hours_until_close.return_value = None
-        # whale trade → raw 3.0 (< 3.0*1.5=4.5 → LOW)
         trade = {"usdcSize": "50000", "conditionId": "c", "proxyWallet": "", "price": "0.5"}
         result = run(det.score_trade(trade, {}))
         assert result is not None
         assert result.severity == "LOW"
 
     def test_severity_medium(self):
-        cfg = AnomalyConfig()
-        cfg.scoring.alert_threshold = 2.0
-        cfg.scoring.high_severity_threshold = 10.0
-        cfg.scoring.weight_by_liquidity = False
-        cfg.scoring.max_single_factor_score = 10.0
+        # whale trade=3.0 >= threshold*1.5=3.0 → MEDIUM
+        cfg = self._cfg_for_score_trade(
+            scoring__alert_threshold=2.0,
+            scoring__high_severity_threshold=10.0,
+            scoring__weight_by_liquidity=False,
+            scoring__max_single_factor_score=10.0,
+        )
         det, client = make_detector(cfg)
         client.hours_until_close.return_value = None
-        # whale trade → raw 3.0, threshold*1.5 = 3.0 → 3.0 >= 3.0 → MEDIUM
         trade = {"usdcSize": "50000", "conditionId": "c", "proxyWallet": "", "price": "0.5"}
         result = run(det.score_trade(trade, {}))
         assert result is not None
         assert result.severity == "MEDIUM"
 
     def test_severity_high(self):
-        cfg = AnomalyConfig()
-        cfg.scoring.alert_threshold = 1.0
-        cfg.scoring.high_severity_threshold = 3.0
-        cfg.scoring.weight_by_liquidity = False
-        cfg.scoring.max_single_factor_score = 10.0
+        # large(1.0) + whale(2.0) = 3.0 >= high_severity(3.0) → HIGH
+        cfg = self._cfg_for_score_trade(
+            scoring__alert_threshold=1.0,
+            scoring__high_severity_threshold=3.0,
+            scoring__weight_by_liquidity=False,
+            scoring__max_single_factor_score=10.0,
+        )
         det, client = make_detector(cfg)
         client.hours_until_close.return_value = None
-        # whale trade → large(1.0) + whale(2.0) = 3.0 >= high_severity(3.0) → HIGH
         trade = {"usdcSize": "50000", "conditionId": "c", "proxyWallet": "", "price": "0.5"}
         result = run(det.score_trade(trade, {}))
         assert result is not None
@@ -534,42 +586,40 @@ class TestScoreTrade:
 
     def test_factor_clamped_to_max_single_factor_score(self):
         """No single factor can exceed max_single_factor_score."""
-        cfg = AnomalyConfig()
-        cfg.scoring.max_single_factor_score = 0.5
-        cfg.scoring.alert_threshold = 999.0   # prevent alert
-        cfg.scoring.weight_by_liquidity = False
+        cfg = self._cfg_for_score_trade(
+            scoring__max_single_factor_score=0.5,
+            scoring__alert_threshold=999.0,
+            scoring__weight_by_liquidity=False,
+        )
         det, client = make_detector(cfg)
         client.hours_until_close.return_value = None
-        # Whale trade: raw 3.0 clamped to 0.5, total < 999 → None
         trade = {"usdcSize": "100000", "conditionId": "c", "proxyWallet": "", "price": "0.5"}
         assert run(det.score_trade(trade, {})) is None
 
     def test_liquidity_amplification_capped_at_2x(self):
-        cfg = AnomalyConfig()
-        cfg.scoring.alert_threshold = 0.5
-        cfg.scoring.weight_by_liquidity = True
-        cfg.scoring.max_single_factor_score = 1.0
-        cfg.volume.thin_market_volume_usd = 1_000_000.0
-        # Make volume dominance impossible to trigger
-        cfg.volume.trade_volume_fraction_threshold = 500.0
-        cfg.trade_size.large_trade_threshold_usd = 100.0
+        cfg = self._cfg_for_score_trade(
+            scoring__alert_threshold=0.5,
+            scoring__weight_by_liquidity=True,
+            scoring__max_single_factor_score=1.0,
+            volume__thin_market_volume_usd=1_000_000.0,
+            volume__trade_volume_fraction_threshold=500.0,
+            trade_size__large_trade_threshold_usd=100.0,
+        )
         det, client = make_detector(cfg)
         client.hours_until_close.return_value = None
         trade = {"usdcSize": "200", "conditionId": "c", "proxyWallet": "", "price": "0.5"}
-        # market_24h_vol = 1, liquidity_factor = 1M/1 = 1M, capped to 2.0
-        # raw score = 1.0 (large trade, capped at 1.0), amplified = 2.0
         result = run(det.score_trade(trade, {"volume24hr": "1"}))
         assert result is not None
         assert result.total_score == pytest.approx(2.0)
 
     def test_liquidity_weighting_skipped_when_disabled(self):
-        cfg = AnomalyConfig()
-        cfg.scoring.alert_threshold = 0.5
-        cfg.scoring.weight_by_liquidity = False
-        cfg.scoring.max_single_factor_score = 1.0
-        cfg.trade_size.large_trade_threshold_usd = 100.0
-        # Suppress volume dominance so only the trade_size factor scores
-        cfg.volume.trade_volume_fraction_threshold = 500.0  # 200/1 = 200 < 500
+        cfg = self._cfg_for_score_trade(
+            scoring__alert_threshold=0.5,
+            scoring__weight_by_liquidity=False,
+            scoring__max_single_factor_score=1.0,
+            trade_size__large_trade_threshold_usd=100.0,
+            volume__trade_volume_fraction_threshold=500.0,
+        )
         det, client = make_detector(cfg)
         client.hours_until_close.return_value = None
         trade = {"usdcSize": "200", "conditionId": "c", "proxyWallet": "", "price": "0.5"}
@@ -579,23 +629,25 @@ class TestScoreTrade:
 
     def test_liquidity_weighting_skipped_when_market_vol_zero(self):
         """weight_by_liquidity condition requires market_24h_vol > 0."""
-        cfg = AnomalyConfig()
-        cfg.scoring.alert_threshold = 0.5
-        cfg.scoring.weight_by_liquidity = True
-        cfg.scoring.max_single_factor_score = 1.0
-        cfg.trade_size.large_trade_threshold_usd = 100.0
+        cfg = self._cfg_for_score_trade(
+            scoring__alert_threshold=0.5,
+            scoring__weight_by_liquidity=True,
+            scoring__max_single_factor_score=1.0,
+            trade_size__large_trade_threshold_usd=100.0,
+        )
         det, client = make_detector(cfg)
         client.hours_until_close.return_value = None
         trade = {"usdcSize": "200", "conditionId": "c", "proxyWallet": "", "price": "0.5"}
         result = run(det.score_trade(trade, {"volume24hr": "0"}))
         assert result is not None
-        assert result.total_score == pytest.approx(1.0)  # no amplification
+        assert result.total_score == pytest.approx(1.0)
 
     def test_result_total_score_is_rounded(self):
-        cfg = AnomalyConfig()
-        cfg.scoring.alert_threshold = 0.5
-        cfg.scoring.weight_by_liquidity = False
-        cfg.trade_size.large_trade_threshold_usd = 100.0
+        cfg = self._cfg_for_score_trade(
+            scoring__alert_threshold=0.5,
+            scoring__weight_by_liquidity=False,
+            trade_size__large_trade_threshold_usd=100.0,
+        )
         det, client = make_detector(cfg)
         client.hours_until_close.return_value = None
         trade = {"usdcSize": "200", "conditionId": "c", "proxyWallet": "", "price": "0.5"}

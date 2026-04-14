@@ -40,11 +40,30 @@ class PolymarketClient:
         if self._owns_session and self._session:
             await self._session.close()
 
-    async def _get(self, base: str, path: str, params: dict = None) -> dict | list:
+    async def _get(
+        self,
+        base: str,
+        path: str,
+        params: dict = None,
+        *,
+        _retries: int = 4,
+    ) -> dict | list:
         url = f"{base}{path}"
-        async with self._session.get(url, params=params or {}) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+        backoff = 2.0
+        for attempt in range(_retries):
+            async with self._session.get(url, params=params or {}) as resp:
+                if resp.status == 429:
+                    retry_after = float(resp.headers.get("Retry-After", backoff))
+                    log.warning(
+                        "Rate-limited by %s — waiting %.0fs (attempt %d/%d)",
+                        base, retry_after, attempt + 1, _retries,
+                    )
+                    await asyncio.sleep(retry_after)
+                    backoff = min(backoff * 2, 60.0)
+                    continue
+                resp.raise_for_status()
+                return await resp.json()
+        raise RuntimeError(f"Exceeded retry limit for {url}")
 
     # ------------------------------------------------------------------ #
     # Gamma API — market discovery
@@ -64,8 +83,12 @@ class PolymarketClient:
         """Return a single market by condition_id."""
         return await self._get(GAMMA_BASE, f"/markets/{condition_id}")
 
-    async def get_all_active_markets(self, page_size: int = 100) -> list[dict]:
-        """Paginate through all active markets."""
+    async def get_all_active_markets(
+        self,
+        page_size: int = 100,
+        inter_page_delay: float = 0.25,
+    ) -> list[dict]:
+        """Paginate through all active markets with a small inter-page delay."""
         markets, offset = [], 0
         while True:
             page = await self.get_active_markets(limit=page_size, offset=offset)
@@ -75,6 +98,7 @@ class PolymarketClient:
             if len(page) < page_size:
                 break
             offset += page_size
+            await asyncio.sleep(inter_page_delay)
         return markets
 
     # ------------------------------------------------------------------ #

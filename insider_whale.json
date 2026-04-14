@@ -1,0 +1,51 @@
+{
+    "_comment": "Insider-whale detection profile. Run with: python bot.py --config insider_whale.json",
+
+    "trade_size": {
+        "min_trade_size_usd": 1000.0,
+        "large_trade_threshold_usd": 25000.0,
+        "large_trade_score_bonus": 1.0,
+        "whale_trade_threshold_usd": 100000.0,
+        "whale_trade_score_bonus": 2.5
+    },
+
+    "account": {
+        "new_account_age_days": 14,
+        "new_account_score_multiplier": 1.8,
+        "min_prior_trades_for_established": 20,
+        "low_history_score_multiplier": 1.5
+    },
+
+    "volume": {
+        "trade_volume_fraction_threshold": 0.20,
+        "thin_market_volume_usd": 10000.0,
+        "thin_market_score_multiplier": 2.0,
+        "volume_spike_window_minutes": 60,
+        "volume_spike_multiplier": 5.0,
+        "volume_spike_score_bonus": 1.5
+    },
+
+    "price_impact": {
+        "min_price_impact": 0.08,
+        "price_impact_score_per_cent": 0.30,
+        "high_conviction_price_threshold": 0.80,
+        "high_conviction_score_bonus": 2.0
+    },
+
+    "timing": {
+        "late_trade_window_hours": 24.0,
+        "late_trade_score_multiplier": 1.8,
+        "early_trade_window_hours": 1.0,
+        "early_large_trade_score_bonus": 1.2
+    },
+
+    "scoring": {
+        "alert_threshold": 5.0,
+        "high_severity_threshold": 9.0,
+        "weight_by_liquidity": true,
+        "max_single_factor_score": 4.0
+    },
+                                                                                                                                    
+    "watched_markets": ["my-market-slug", "another-slug"]                                               
+  
+}
